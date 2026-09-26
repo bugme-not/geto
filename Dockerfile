@@ -7,12 +7,9 @@ RUN apt-get update && apt-get install -y \
     openssh-server nginx python3 python3-pip cmake git wget curl ca-certificates unzip supervisor \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Install uvloop and aiohttp for high-performance asyncio servers
-RUN pip3 install --break-system-packages uvloop aiohttp
-
-# Direct Xray Core installation
-RUN XRAY_VER=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/') \
-    && wget -O /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VER}/Xray-linux-64.zip" \
+# Direct Xray Core installation (Direct download with fallback)
+RUN (wget -O /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip" || \
+     wget -O /tmp/xray.zip "https://ghproxy.com/https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip") \
     && unzip /tmp/xray.zip -d /usr/local/bin/ \
     && chmod +x /usr/local/bin/xray \
     && mkdir -p /usr/local/etc/xray \
@@ -27,17 +24,23 @@ RUN git clone https://github.com/ambrop72/badvpn.git /tmp/badvpn \
 RUN mkdir -p /var/run/sshd /run/sshd
 RUN useradd -m -s /bin/bash geto && echo 'geto:suguru' | chpasswd
 
-# Configure OpenSSH settings
+# Configure OpenSSH settings for maximum speed & low latency
 RUN echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
 RUN echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config
 RUN { \
     echo "UseDNS no"; \
+    echo "GSSAPIAuthentication no"; \
+    echo "GSSAPIKeyExchange no"; \
     echo "TCPKeepAlive yes"; \
-    echo "ClientAliveInterval 15"; \
-    echo "ClientAliveCountMax 3"; \
-    echo "MaxSessions 50"; \
-    echo "MaxStartups 50:30:100"; \
+    echo "ClientAliveInterval 10"; \
+    echo "ClientAliveCountMax 2"; \
+    echo "MaxSessions 500"; \
+    echo "MaxStartups 1000:30:2000"; \
+    echo "MaxAuthTries 10"; \
     echo "Compression no"; \
+    echo "Ciphers aes128-gcm@openssh.com,chacha20-poly1305@openssh.com,aes128-ctr"; \
+    echo "MACs hmac-sha2-256-etm@openssh.com,umac-64-etm@openssh.com"; \
+    echo "KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org"; \
     } >> /etc/ssh/sshd_config
 
 COPY banner.txt /etc/ssh/banner.txt
