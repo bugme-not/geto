@@ -1,6 +1,7 @@
 import asyncio
 import time
 import socket
+from collections import deque
 
 try:
     import uvloop
@@ -8,52 +9,52 @@ try:
 except ImportError:
     pass
 
-BUF_SIZE = 131072         # 128KB buffer
+BUF_SIZE = 65536          # 64KB optimal buffer for low syscall overhead without memory stall
 MAX_CONN_PER_IP = 150     # Max connections per IP in window
 RATE_LIMIT_WINDOW = 120   # 2-minute sliding window
 
+# Use deques for O(1) popping instead of O(N) list comprehensions
 ip_connections = {}
 
 def check_rate_limit(ip: str) -> bool:
     now = time.time()
-    timestamps = ip_connections.setdefault(ip, [])
+    timestamps = ip_connections.setdefault(ip, deque())
     
-    # Prune old timestamps
-    ip_connections[ip] = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW]
+    # O(1) cleanup of old timestamps from the left
+    while timestamps and now - timestamps[0] >= RATE_LIMIT_WINDOW:
+        timestamps.popleft()
     
-    if len(ip_connections[ip]) >= MAX_CONN_PER_IP:
+    if len(timestamps) >= MAX_CONN_PER_IP:
         return False
     
-    ip_connections[ip].append(now)
+    timestamps.append(now)
     return True
 
 async def cleanup_stale_ips():
-    """Periodic task to purge idle IP records from memory."""
+    """Periodic background task to purge idle IP records."""
     while True:
-        await asyncio.sleep(300)
+        await asyncio.sleep(60)
         now = time.time()
         for ip in list(ip_connections.keys()):
-            ip_connections[ip] = [t for t in ip_connections[ip] if now - t < RATE_LIMIT_WINDOW]
-            if not ip_connections[ip]:
+            timestamps = ip_connections[ip]
+            while timestamps and now - timestamps[0] >= RATE_LIMIT_WINDOW:
+                timestamps.popleft()
+            if not timestamps:
                 del ip_connections[ip]
 
 async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    """Bidirectional pipe for proxying data streams."""
+    """Bidirectional streaming without excessive drain pauses."""
     try:
         while True:
             data = await reader.read(BUF_SIZE)
             if not data:
                 break
             writer.write(data)
-            await writer.drain()
-    except (asyncio.CancelledError, Exception):
+            # Do not await writer.drain() on every chunk to eliminate context-switch delay
+    except Exception:
         pass
     finally:
         writer.close()
-        try:
-            await writer.wait_closed()
-        except Exception:
-            pass
 
 async def handle_client(client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter):
     # Extract client IP address safely
@@ -62,12 +63,21 @@ async def handle_client(client_reader: asyncio.StreamReader, client_writer: asyn
 
     if not check_rate_limit(client_ip):
         client_writer.close()
-        await client_writer.wait_closed()
         return
 
     try:
-        # Read the initial HTTP request header
-        await client_reader.read(4096)
+        # Tune client socket IMMEDIATELY before reading
+        client_sock = client_writer.get_extra_info('socket')
+        if client_sock:
+            client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            try:
+                client_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)
+                client_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576)
+            except OSError:
+                pass
+
+        # FIX 1: Read HTTP header immediately until end-of-header delimiter instead of waiting for 4096 bytes
+        await client_reader.readuntil(b"\r\n\r\n")
         
         # Send HTTP 101 WebSocket handshake acknowledgement
         response_header = (
@@ -76,16 +86,19 @@ async def handle_client(client_reader: asyncio.StreamReader, client_writer: asyn
             b"Connection: Upgrade\r\n\r\n"
         )
         client_writer.write(response_header)
-        await client_writer.drain()
 
         # Connect to local SSH daemon
         ssh_reader, ssh_writer = await asyncio.open_connection('127.0.0.1', 22)
 
-        # Tune underlying sockets if available
-        for writer in (client_writer, ssh_writer):
-            sock = writer.get_extra_info('socket')
-            if sock:
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        # Tune SSH socket
+        ssh_sock = ssh_writer.get_extra_info('socket')
+        if ssh_sock:
+            ssh_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            try:
+                ssh_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)
+                ssh_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576)
+            except OSError:
+                pass
 
         # Run bidirectional piping concurrently
         await asyncio.gather(
@@ -104,10 +117,10 @@ async def main():
         handle_client,
         '127.0.0.1',
         2222,
-        backlog=1000,
+        backlog=2048,
         reuse_address=True
     )
-    print("[+] Anti-DDoS bridge running with uvloop on 127.0.0.1:2222")
+    print("[+] Low-latency WebSocket bridge running with uvloop on 127.0.0.1:2222")
     async with server:
         await server.serve_forever()
 
